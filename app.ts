@@ -204,7 +204,14 @@ export function createApp(): Server {
         path,
       };
       const result = handleRest(ctx);
-      sendJson(res, result.status, result.body, { 'x-github-request-id': requestId, ...(result.headers ?? {}) });
+      const headers = { 'x-github-request-id': requestId, ...(result.headers ?? {}) };
+      if (result.text !== undefined) {
+        // A handler that already serialized its body (the memoized issue read) skips the
+        // stringify pass; the bytes on the wire are the same either way.
+        sendBuffer(res, result.status, JSON_TYPE, Buffer.from(result.text, 'utf8'), headers);
+        return;
+      }
+      sendJson(res, result.status, result.body, headers);
       return;
     }
 

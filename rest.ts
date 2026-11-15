@@ -18,7 +18,7 @@ import {
   type TreeEntry,
 } from './git.ts';
 import { branchJson, commentJson, commitJson, issueJson, labelJson, pullJson, repoJson, userJson } from './shapes.ts';
-import { ZERO_OID, type Repo, type Store, type ThreadRec } from './store.ts';
+import { ZERO_OID, type IssueRec, type Repo, type Store, type ThreadRec } from './store.ts';
 
 export interface RestCtx {
   store: Store;
@@ -37,6 +37,8 @@ export interface RestCtx {
 export interface RestResult {
   status: number;
   body?: unknown;
+  /** Pre-serialized JSON body, byte-identical to what the shell would stringify; wins over body. */
+  text?: string;
   headers?: Record<string, string>;
 }
 
@@ -104,6 +106,54 @@ function paginate<T>(ctx: RestCtx, items: readonly T[]): { page: T[]; headers: R
     links.push(`<${urlFor(1)}>; rel="first"`);
   }
   return { page: slice, headers: links.length > 0 ? { link: links.join(', ') } : {} };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The serialized-issue memo
+
+/**
+ * GET /issues/{n} is the read hot path, and an issue's JSON is a pure function of the issue
+ * record plus the definitions of the labels it carries. The memo keeps the exact serialized
+ * bytes for that function, guarded by a fingerprint of its inputs: any mutation that could
+ * change the bytes — a comment (the count), a PATCH (title/body/state/labels, and the
+ * updatedSec bump every PATCH performs), a label edit (its colour or description) — changes
+ * the fingerprint and rebuilds, so stale bytes are never served.
+ */
+const issueTextMemo = new WeakMap<Store, Map<string, { fingerprint: string; text: string }>>();
+
+function issueFingerprint(repo: Repo, issue: IssueRec): string {
+  let fingerprint = [
+    issue.id,
+    issue.number,
+    issue.state,
+    issue.atSec,
+    issue.updatedSec,
+    issue.comments.length,
+    issue.authorLogin,
+    issue.title,
+    issue.body,
+  ].join('|');
+  for (const name of issue.labels) {
+    const label = repo.labels.get(name);
+    fingerprint += `|${name}=${label?.color ?? ''}:${label?.description ?? ''}`;
+  }
+  return fingerprint;
+}
+
+function issueGetText(store: Store, repo: Repo, issue: IssueRec): string {
+  let memo = issueTextMemo.get(store);
+  if (memo === undefined) {
+    memo = new Map();
+    issueTextMemo.set(store, memo);
+  }
+  const key = `${repo.databaseId}:${issue.number}`;
+  const fingerprint = issueFingerprint(repo, issue);
+  const hit = memo.get(key);
+  if (hit !== undefined && hit.fingerprint === fingerprint) return hit.text;
+  const text = `${JSON.stringify(issueJson(store, repo, issue))}\n`;
+  if (memo.size >= 256) memo.clear();
+  memo.set(key, { fingerprint, text });
+  return text;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -494,7 +544,7 @@ function issuesRoute(ctx: RestCtx, repo: Repo, rest: string[]): RestResult {
   if (rest.length === 2) {
     const thread = threadOr404(repo, number);
     if (method === 'GET') {
-      if (thread.kind === 'issue') return { status: 200, body: issueJson(store, repo, thread) };
+      if (thread.kind === 'issue') return { status: 200, text: issueGetText(store, repo, thread) };
       return { status: 200, body: pullJson(store, repo, thread, thread.state === 'open' ? pullMergeable(repo, thread) : thread.merged ? true : null) };
     }
     if (method === 'PATCH') {

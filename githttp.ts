@@ -56,8 +56,57 @@ function sidebandPackets(band: number, data: Buffer): Buffer[] {
 export class GitHttp {
   private readonly store: Store;
 
+  /**
+   * Memoized fetch responses (the whole answer body), keyed by everything the answer is
+   * computed from. A clone-heavy client asks the same question many times in a row — fifty
+   * concurrent shallow clones of one repository are fifty copies of one request — and the
+   * planning + pack building behind each answer is the forge's most expensive work, so the
+   * second and later copies should cost a map lookup, not a rebuild.
+   */
+  private readonly fetchMemo = new Map<string, Buffer>();
+
   constructor(store: Store) {
     this.store = store;
+  }
+
+  /**
+   * A fingerprint of the repository state a fetch answer depends on. Objects are
+   * content-addressed and, within one repository's life, only ever added — never mutated
+   * (an oid names its bytes) and never removed — so the object count plus the full ref
+   * listing pins the exact object set: any later state with the same count and the same
+   * refs holds the same objects, and any state that differs in either misses the memo.
+   */
+  private stateFingerprint(repo: Repo): string {
+    let fingerprint = `${repo.objects.size}|`;
+    for (const [name, oid] of repo.refs) fingerprint += `${name}=${oid};`;
+    return fingerprint;
+  }
+
+  /** The memo key for one fetch request: protocol variant, repository, state, and ask. */
+  private fetchKey(
+    repo: Repo,
+    variant: 'v0' | 'v2',
+    wants: readonly string[],
+    haves: readonly string[],
+    shallow: readonly string[],
+    depth: number | null,
+  ): string {
+    return [
+      variant,
+      repo.databaseId,
+      this.stateFingerprint(repo),
+      wants.join(','),
+      haves.join(','),
+      shallow.join(','),
+      depth === null ? '' : String(depth),
+    ].join('|');
+  }
+
+  /** Remember a fetch answer body; the memo stays small by emptying rather than evicting. */
+  private memoizeFetch(key: string, body: Buffer): Buffer {
+    if (this.fetchMemo.size >= 128) this.fetchMemo.clear();
+    this.fetchMemo.set(key, body);
+    return body;
   }
 
   private repo(owner: string, name: string): Repo | null {
@@ -206,6 +255,9 @@ export class GitHttp {
         return gitResult('git-upload-pack', 'result', Buffer.concat([pktLine(`ERR upload-pack: not our ref ${want}\n`), PKT_FLUSH]));
       }
     }
+    const memoKey = this.fetchKey(repo, 'v2', wants, haves, shallow, depth);
+    const memoized = this.fetchMemo.get(memoKey);
+    if (memoized !== undefined) return gitResult('git-upload-pack', 'result', memoized);
     const plan = planFetch(repo, wants, haves, shallow, depth);
     const parts: Buffer[] = [];
     parts.push(pktLine('acknowledgments\n'));
@@ -225,7 +277,7 @@ export class GitHttp {
       for (const packet of sidebandPackets(1, pack)) parts.push(packet);
     }
     parts.push(PKT_FLUSH);
-    return gitResult('git-upload-pack', 'result', Buffer.concat(parts));
+    return gitResult('git-upload-pack', 'result', this.memoizeFetch(memoKey, Buffer.concat(parts)));
   }
 
   private fetchV0(repo: Repo, packets: Pkt[]): HttpResult {
@@ -249,6 +301,9 @@ export class GitHttp {
         haves.push(line.slice(5).trim());
       }
     }
+    const memoKey = this.fetchKey(repo, 'v0', wants, haves, shallow, depth);
+    const memoized = this.fetchMemo.get(memoKey);
+    if (memoized !== undefined) return gitResult('git-upload-pack', 'result', memoized);
     const plan = planFetch(repo, wants, haves, shallow, depth);
     const parts: Buffer[] = [];
     for (const oid of plan.shallow) parts.push(pktLine(`shallow ${oid}\n`));
@@ -259,7 +314,7 @@ export class GitHttp {
       for (const packet of sidebandPackets(1, pack)) parts.push(packet);
     }
     parts.push(PKT_FLUSH);
-    return gitResult('git-upload-pack', 'result', Buffer.concat(parts));
+    return gitResult('git-upload-pack', 'result', this.memoizeFetch(memoKey, Buffer.concat(parts)));
   }
 
   // -------------------------------------------------------------------------------------------

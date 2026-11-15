@@ -1,113 +1,125 @@
-// Boot-and-wait shell for the forge.
+// The forge's lifecycle shell: how this process reports for duty and takes its leave.
 //
-// This file owns no forge logic at all — app.ts builds the server. What lives here is the
-// conversation with the trial environment that hosts the process, and it runs in four beats:
+// app.ts builds the server; this file only conducts the conversation with the trial
+// environment around it, and that conversation has a strict shape:
 //
-//   1. Find the environment. MAKEFUN_ENV_URL carries its origin. If the variable is missing
-//      or blank there is nobody to report to, so the process complains on stderr and exits 1
-//      before doing anything else.
-//   2. Take whatever port the kernel offers. The server listens on port 0 (an ephemeral
-//      pick) — never a fixed number, because the environment owns the well-known ones.
-//   3. Introduce ourselves: POST {"port": N} to the environment's /register endpoint. It
-//      notes the caller's address together with N and reaches the server at that base URL
-//      from then on. Registration is first-come-first-served: a 409 means another process
-//      registered earlier and won, which this process simply accepts. A 400 or 405 is a
-//      contract violation and is fatal. Anything else — a refused connection, a timeout, a
-//      5xx while the environment is still coming up — is retried with a growing pause.
-//   4. Wait to be dismissed. GET /done answers immediately with {"done": false} while the
-//      trial runs, so dismissal is polled, with the same retry rhythm, until the body says
-//      {"done": true}. Only then is the server closed and the process exits 0 — it never
-//      leaves early on its own judgement.
+//   - The environment's origin arrives as MAKEFUN_ENV_URL. Without it there is nobody
+//     to register with and nothing to wait for, so the process says so on stderr and
+//     exits 1 before it has bound a socket or built anything.
+//   - The server binds port 0. The environment, not the entry, owns the fixed ports;
+//     an ephemeral pick is the only polite choice, and the chosen number is meaningless
+//     until it has been announced.
+//   - Announcing is a POST of {"port": N} to /register. A 200 records us; a 409 means
+//     another process registered first and keeps the slot — also a fine outcome, the
+//     slot is what matters, not who holds it. A 400 or 405 says the announcement
+//     itself broke the contract, which no retry can fix, so it is fatal. Everything
+//     else (a 5xx from an environment still warming up, a refused connection, a
+//     timeout) is retried on a doubling pause.
+//   - Leaving is the environment's decision. GET /done answers at once, so the
+//     process polls it on the same retry rhythm until the body says {"done": true},
+//     then closes the server and exits 0. It never walks away early on its own say-so.
 
 import { createApp } from './app.ts';
 
-/** The environment's origin, with any trailing slashes trimmed so paths join cleanly. */
-const envBase = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+/** Where the environment lives, trailing slashes stripped so path joins stay clean. */
+const envOrigin = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 
-if (envBase === '') {
+if (envOrigin === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
   process.exit(1);
 }
 
-/** Ceiling for a single register or poll request before it counts as failed. */
-const REQUEST_DEADLINE_MS = 30_000;
-/** Pause after the first failure; each further failure doubles it, up to the cap. */
-const BACKOFF_START_MS = 250;
-const BACKOFF_CAP_MS = 2_000;
+/** One environment call gets this long before it counts as a failure. */
+const ENV_CALL_TIMEOUT_MS = 30_000;
+/** The pause after a first failure; it doubles per consecutive failure, capped. */
+const FIRST_RETRY_MS = 250;
+const MAX_RETRY_MS = 2_000;
 
-/** Promise-flavoured setTimeout. */
-const pause = (ms: number): Promise<void> =>
+/** setTimeout as a promise, for the retry pauses. */
+const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
 
 /**
- * How long to rest after `failures` consecutive failures: BACKOFF_START_MS doubled once per
- * failure (the exponent is clamped so the shift stays sane) and never above BACKOFF_CAP_MS.
+ * The pause after `failures` failures in a row: FIRST_RETRY_MS doubled once per
+ * failure — the exponent clamped at 8 so the doubling stays sane — and never more
+ * than MAX_RETRY_MS.
  */
-function backoffMs(failures: number): number {
-  const doubled = BACKOFF_START_MS * 2 ** Math.min(failures, 8);
-  return Math.min(BACKOFF_CAP_MS, doubled);
+function retryDelay(failures: number): number {
+  return Math.min(MAX_RETRY_MS, FIRST_RETRY_MS * 2 ** Math.min(failures, 8));
+}
+
+/** One attempt's verdict: finished (with a value), or not yet — pause and try again. */
+type Attempt<T> = { finished: true; value: T } | { finished: false };
+
+/**
+ * Drive an attempt until it reports finished, pausing on the retry rhythm between
+ * tries. An attempt that throws (a fatal refusal) escapes immediately: the rhythm
+ * is for an environment that is not ready, not for answers that reject us outright.
+ */
+async function drive<T>(attempt: () => Promise<Attempt<T>>): Promise<T> {
+  let failures = 0;
+  for (;;) {
+    const outcome = await attempt();
+    if (outcome.finished) return outcome.value;
+    await sleep(retryDelay(failures));
+    failures += 1;
+  }
 }
 
 /**
- * Tell the environment which port the server bound, retrying until it acknowledges us.
- * 200 (recorded) and 409 (someone registered first) both end the loop normally; 400 and
- * 405 reject the registration outright and are thrown to the caller as fatal.
+ * Announce the bound port until the environment acknowledges it. 200 (recorded) and
+ * 409 (an earlier process holds the slot) both finish; 400 and 405 refuse the
+ * announcement itself and are thrown as fatal; any other outcome is not finished.
  */
-async function registerWithEnv(port: number): Promise<void> {
-  let failures = 0;
-  for (;;) {
+async function announcePort(port: number): Promise<void> {
+  await drive(async (): Promise<Attempt<void>> => {
     let refusal: Error | null = null;
     try {
-      const reply = await fetch(`${envBase}/register`, {
+      const reply = await fetch(`${envOrigin}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(REQUEST_DEADLINE_MS),
+        signal: AbortSignal.timeout(ENV_CALL_TIMEOUT_MS),
       });
-      if (reply.status === 200 || reply.status === 409) return;
+      if (reply.status === 200 || reply.status === 409) return { finished: true, value: undefined };
       if (reply.status === 400 || reply.status === 405) {
         refusal = new Error(`register answered HTTP ${reply.status}: ${await reply.text()}`);
       }
-      // Any other status: the environment is not ready to hear us yet — fall through and retry.
+      // Any other status: the environment is not ready to hear us yet.
     } catch {
-      // Transport trouble (unreachable, aborted, timed out): also just a reason to retry.
+      // Transport trouble (unreachable, aborted, timed out): also just not finished.
     }
     if (refusal !== null) throw refusal;
-    await pause(backoffMs(failures));
-    failures += 1;
-  }
+    return { finished: false };
+  });
 }
 
 /**
- * Ask the environment, again and again, whether the trial is finished. Returns only once a
- * poll answers 200 with {"done": true}; every other outcome — not done yet, an error status,
- * an unreachable environment — waits out the backoff and asks again.
+ * Poll /done until the environment dismisses us. Only a 200 whose body says
+ * {"done": true} finishes; every other outcome — not done yet, an error status, an
+ * unreachable environment — is simply not finished.
  */
-async function pollUntilDone(): Promise<void> {
-  let failures = 0;
-  for (;;) {
-    let finished = false;
+async function awaitDismissal(): Promise<void> {
+  await drive(async (): Promise<Attempt<void>> => {
     try {
-      const reply = await fetch(`${envBase}/done`, {
-        signal: AbortSignal.timeout(REQUEST_DEADLINE_MS),
+      const reply = await fetch(`${envOrigin}/done`, {
+        signal: AbortSignal.timeout(ENV_CALL_TIMEOUT_MS),
       });
       if (reply.ok) {
         const payload = (await reply.json()) as { done?: unknown };
-        finished = payload.done === true;
+        if (payload.done === true) return { finished: true, value: undefined };
       }
     } catch {
-      finished = false;
+      // A failed poll says nothing about dismissal; keep waiting.
     }
-    if (finished) return;
-    await pause(backoffMs(failures));
-    failures += 1;
-  }
+    return { finished: false };
+  });
 }
 
-/** The process's whole life: bind, register, serve by waiting, shut down when dismissed. */
-async function start(): Promise<void> {
+/** The whole life of the process: bind, announce, serve by waiting, leave when told. */
+async function main(): Promise<void> {
   const server = createApp();
 
   await new Promise<void>((resolve, reject) => {
@@ -123,15 +135,15 @@ async function start(): Promise<void> {
   }
   process.stdout.write(`[entry] listening on port ${bound.port}\n`);
 
-  await registerWithEnv(bound.port);
+  await announcePort(bound.port);
   process.stdout.write('[entry] registered; waiting for the env to say done\n');
 
-  await pollUntilDone();
+  await awaitDismissal();
   server.close();
   process.stdout.write('[entry] done\n');
 }
 
-start().then(
+main().then(
   () => {
     process.exit(0);
   },
