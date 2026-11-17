@@ -156,6 +156,21 @@ function issueGetText(store: Store, repo: Repo, issue: IssueRec): string {
   return text;
 }
 
+/**
+ * The app shell's accelerator for the single-issue read: the same memoized bytes the
+ * generic route serves for GET /repos/{owner}/{repo}/issues/{n}, or null when the
+ * generic route would answer anything else (unknown repo, unknown number, a pull
+ * request) — the caller then falls through to the generic route untouched, so the
+ * fast path can only ever serve a response the generic route would have produced.
+ */
+export function fastIssueGetText(store: Store, owner: string, name: string, number: number): string | null {
+  const repo = store.repoOf(owner, name);
+  if (repo === null) return null;
+  const thread = repo.threads.get(number);
+  if (thread === undefined || thread.kind !== 'issue') return null;
+  return issueGetText(store, repo, thread);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Contents helpers
 

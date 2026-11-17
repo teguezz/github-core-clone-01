@@ -65,8 +65,25 @@ export class GitHttp {
    */
   private readonly fetchMemo = new Map<string, Buffer>();
 
+  /**
+   * Memoized advertisements and ls-refs answers, keyed like the fetch memo (repository,
+   * state fingerprint, and every request input the bytes depend on — the service, the
+   * default branch the HEAD symref names, and for ls-refs the peel/symref/unborn flags
+   * and ref prefixes). An advertisement is a pure function of the ref listing, and a
+   * clone- or push-heavy client asks for it before every exchange — the same question
+   * fifty times in a row should cost a map lookup, not a rebuild.
+   */
+  private readonly adsMemo = new Map<string, Buffer>();
+
   constructor(store: Store) {
     this.store = store;
+  }
+
+  /** Remember an advertisement/ls-refs body; the memo stays small by emptying rather than evicting. */
+  private memoizeAds(key: string, body: Buffer): Buffer {
+    if (this.adsMemo.size >= 128) this.adsMemo.clear();
+    this.adsMemo.set(key, body);
+    return body;
   }
 
   /**
@@ -122,6 +139,9 @@ export class GitHttp {
     }
     const repo = this.repo(owner, name);
     if (repo === null) return text(404, 'repository not found\n');
+    const adsKey = `${repo.databaseId}|${service}|${protocolV2 && service === 'git-upload-pack' ? 'v2' : 'v0'}|${repo.defaultBranch}|${this.stateFingerprint(repo)}`;
+    const memoizedAds = this.adsMemo.get(adsKey);
+    if (memoizedAds !== undefined) return gitResult(service, 'advertisement', memoizedAds);
     if (service === 'git-upload-pack' && protocolV2) {
       const parts: Buffer[] = [
         pktLine('# service=git-upload-pack\n'),
@@ -133,7 +153,7 @@ export class GitHttp {
         pktLine('object-format=sha1\n'),
         PKT_FLUSH,
       ];
-      return gitResult('git-upload-pack', 'advertisement', Buffer.concat(parts));
+      return gitResult('git-upload-pack', 'advertisement', this.memoizeAds(adsKey, Buffer.concat(parts)));
     }
     const caps = service === 'git-upload-pack' ? `${UPLOAD_CAPS_V0} agent=${AGENT}` : `${RECEIVE_CAPS} agent=${AGENT}`;
     const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
@@ -167,7 +187,7 @@ export class GitHttp {
       }
     }
     parts.push(PKT_FLUSH);
-    return gitResult(service, 'advertisement', Buffer.concat(parts));
+    return gitResult(service, 'advertisement', this.memoizeAds(adsKey, Buffer.concat(parts)));
   }
 
   // -------------------------------------------------------------------------------------------
@@ -211,6 +231,9 @@ export class GitHttp {
       else if (line === 'unborn') unborn = true;
       else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
     }
+    const adsKey = `${repo.databaseId}|ls-refs|${peel ? 1 : 0}${symrefs ? 1 : 0}${unborn ? 1 : 0}|${prefixes.join(',')}|${repo.defaultBranch}|${this.stateFingerprint(repo)}`;
+    const memoizedAds = this.adsMemo.get(adsKey);
+    if (memoizedAds !== undefined) return gitResult('git-upload-pack', 'result', memoizedAds);
     const parts: Buffer[] = [];
     for (const ref of listRefs(repo)) {
       if (prefixes.length > 0 && !prefixes.some((prefix) => ref.name.startsWith(prefix))) continue;
@@ -226,7 +249,7 @@ export class GitHttp {
       parts.push(pktLine(`${line}\n`));
     }
     parts.push(PKT_FLUSH);
-    return gitResult('git-upload-pack', 'result', Buffer.concat(parts));
+    return gitResult('git-upload-pack', 'result', this.memoizeAds(adsKey, Buffer.concat(parts)));
   }
 
   private fetchV2(repo: Repo, packets: Pkt[]): HttpResult {

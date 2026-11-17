@@ -7,15 +7,32 @@ import { globalIdOf, type CommentRec, type IssueRec, type PullRec, type Repo, ty
 
 export type Json = Record<string, unknown>;
 
+/**
+ * A user's JSON never changes within a store's life (the user list is fixed at
+ * construction and nothing mutates it), so build it once per login instead of on
+ * every serialization — it is embedded in nearly every shape the forge serves.
+ * Callers treat the result as read-only (they only ever embed and stringify it).
+ */
+const userJsonMemo = new WeakMap<Store, Map<string, Json>>();
+
 export function userJson(store: Store, login: string): Json {
+  let memo = userJsonMemo.get(store);
+  if (memo === undefined) {
+    memo = new Map();
+    userJsonMemo.set(store, memo);
+  }
+  const hit = memo.get(login);
+  if (hit !== undefined) return hit;
   const user = store.users.find((candidate) => candidate.login === login) ?? store.viewer;
-  return {
+  const json: Json = {
     login: user.login,
     id: user.id,
     node_id: globalIdOf({ kind: 'user', userId: user.id }),
     type: 'User',
     site_admin: false,
   };
+  memo.set(login, json);
+  return json;
 }
 
 export function repoJson(store: Store, repo: Repo): Json {

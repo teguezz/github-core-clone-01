@@ -202,6 +202,9 @@ export class Store {
   private issueSeq = 0;
   private commentSeq = 0;
   private clockSec = CLOCK_EPOCH_SEC;
+  /** ISO strings by second: isoOf is a pure function of its argument, and the same
+   *  seconds recur constantly (an issue's created/updated pair, a repo's three stamps). */
+  private readonly isoMemo = new Map<number, string>();
 
   constructor() {
     this.users = scenarioUsers();
@@ -219,7 +222,12 @@ export class Store {
   }
 
   isoOf(sec: number): string {
-    return new Date(sec * 1000).toISOString().replace('.000Z', 'Z');
+    const hit = this.isoMemo.get(sec);
+    if (hit !== undefined) return hit;
+    const text = new Date(sec * 1000).toISOString().replace('.000Z', 'Z');
+    if (this.isoMemo.size >= 4096) this.isoMemo.clear();
+    this.isoMemo.set(sec, text);
+    return text;
   }
 
   createRepo(name: string, options: { description?: string; isPrivate?: boolean }): Repo {

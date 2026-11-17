@@ -791,8 +791,10 @@ export function planFetch(
     const distance = new Map<string, number>();
     const queue: Array<{ oid: string; d: number }> = [];
     for (const commit of wantCommits) queue.push({ oid: commit, d: 0 });
-    while (queue.length > 0) {
-      const { oid, d } = queue.shift() as { oid: string; d: number };
+    let queueHead = 0;
+    while (queueHead < queue.length) {
+      const { oid, d } = queue[queueHead] as { oid: string; d: number };
+      queueHead += 1;
       if (d >= depth) continue;
       if ((distance.get(oid) ?? Number.POSITIVE_INFINITY) <= d) continue;
       distance.set(oid, d);

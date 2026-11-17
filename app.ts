@@ -7,7 +7,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { GitHttp, type HttpResult } from './githttp.ts';
 import { executeGraphQL, type GqlRequest } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
-import { handleRest, type RestCtx } from './rest.ts';
+import { fastIssueGetText, handleRest, type RestCtx } from './rest.ts';
 import { Store } from './store.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
@@ -54,11 +54,31 @@ export function createApp(): Server {
       if (total > MAX_BODY_BYTES) throw new Error('request body is too large');
       chunks.push(buffer);
     }
-    return Buffer.concat(chunks);
+    return chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks);
   };
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const method = req.method ?? 'GET';
+
+    // The single-issue read accelerator: GET /api/v3/repos/{owner}/{repo}/issues/{n}
+    // with no query string is the forge's hottest request shape, and its answer is a
+    // pure function of the store (see rest.ts's serialized-issue memo). Serve it
+    // straight from the memo when it hits; on any miss — no credentials, unknown
+    // repo or number, a pull request — fall through to the generic pipeline below,
+    // which produces exactly the response it would have produced anyway.
+    if (method === 'GET') {
+      const match = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(req.url ?? '');
+      if (match !== null && authorized(req)) {
+        const text = fastIssueGetText(store, match[1] as string, match[2] as string, Number(match[3]));
+        if (text !== null) {
+          requestSeq += 1;
+          const requestId = `F${requestSeq.toString(16).padStart(6, '0')}`;
+          sendBuffer(res, 200, JSON_TYPE, Buffer.from(text, 'utf8'), { 'x-github-request-id': requestId });
+          return;
+        }
+      }
+    }
+
     let url: URL;
     try {
       url = new URL(req.url ?? '/', 'http://entry');
